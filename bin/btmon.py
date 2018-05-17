@@ -706,6 +706,7 @@ mqtt_map=399999_ch1_w,solar,399999_ch1_wh,solar_wh,399999_t1,garage
 mqtt_upload_period=60
 
 
+
 Upgrading:
 
 Please consider the following when upgrading from ecmread.py:
@@ -1202,6 +1203,16 @@ MQTT_RETAIN            = False
 MQTT_MAP               = ''
 MQTT_UPLOAD_PERIOD     = MINUTE
 
+# GoogleIOT defaults
+GOOGLE_IOT_HOST = 'mqtt.googleapis.com'
+GOOGLE_IOT_PORT = 8883
+GOOGLE_IOT_TLS = '{"tls_version":5}'
+GOOGLE_IOT_LOCATIONID = 'us-central1'
+GOOGLE_IOT_PERIOD = MINUTE
+GOOGLE_IOT_JWT_SIGNING_METHOD = 'RS256'
+GOOGLE_IOT_QOS = '0'
+GOOGLE_IOT_RETAIN = False
+
 
 import base64
 import bisect
@@ -1260,6 +1271,11 @@ try:
     import paho.mqtt.publish as publish
 except ImportError:
     publish = None
+
+try:
+    import jwt as jwt
+except ImportError:
+    jwt = None
 
 
 class CounterResetError(Exception):
@@ -4059,7 +4075,6 @@ class PVOutputProcessor(UploadProcessor):
                         '\n  system_id: ' + self.system_id,
                         '\n  data:  ' + payload]))
 
-
 class MQTTProcessor(BaseProcessor):
     def __init__(self, host, port, clientid, base_topic, qos, retain,
                  will, user, passwd, tls, map, period):
@@ -4153,6 +4168,125 @@ class MQTTProcessor(BaseProcessor):
             self.msgs = None
         else:
            dbgmsg('MQTT: Nothing to send')
+
+class GoogleIOTProcessor(BaseProcessor):
+    def __init__(self, project_id, location_id, registry_id, device_id, tls, host, port, period, jwt_private_key, jwt_signing_method, qos, retain):
+        if not publish:
+            print 'GoogleIOT Error: paho.mqtt.publish module could not be imported.'
+            sys.exit(1)
+        if not jwt:
+            print 'GoogleIOT Error: jwt module could not be imported.'
+            sys.exit(1)
+
+        super(GoogleIOTProcessor, self).__init__()
+        self.project_id  = project_id
+        infmsg('GoogleIOT: project_id: %s' % (self.project_id or '<not-specified>'))
+        self.location_id  = location_id
+        infmsg('GoogleIOT: location_id: %s' % (self.location_id or '<not-specified>'))
+        self.registry_id  = registry_id
+        infmsg('GoogleIOT: registry_id: %s' % (self.registry_id or '<not-specified>'))
+        self.device_id  = device_id
+        infmsg('GoogleIOT: device_id: %s' % (self.device_id or '<not-specified>'))
+        self.tls = tls
+        infmsg('GoogleIOT: tls: %s' % (self.tls or '<not-specified>'))
+        self.host  = host
+        infmsg('GoogleIOT: host: %s' % (self.host or '<not-specified>'))
+        self.port  = int(port)
+        infmsg('GoogleIOT: port: %d' % (self.port or '<not-specified>'))
+        self.period = int(period)
+        infmsg('GoogleIOT: period: %d' % (self.period or '<not-specified>'))
+        self.jwt_private_key  = jwt_private_key
+        infmsg('GoogleIOT: jwt_private_key: %s' % (self.jwt_private_key or '<not-specified>'))
+        self.jwt_signing_method  = jwt_signing_method
+        infmsg('GoogleIOT: jwt_signing_method: %s' % (self.jwt_signing_method or '<not-specified>'))
+        self.qos = int(0)
+        #self.qos = 0 issue with int(0) = false
+        #infmsg('GoogleIOT: qos: %d' % (self.qos or '<not-specified>'))
+        self.retain  = retain
+        infmsg('GoogleIOT: retain: %s' % (self.retain or '<not-specified>'))
+
+
+    def setup(self):
+        dbgmsg('GoogleIOT: setup')
+
+        if self.qos not in (0, 1, 2):
+            print 'GoogleIOT Error: qos values are 0, 1 or 2'
+            sys.exit(1)
+
+	if (self.project_id is None):
+            print 'GoogleIOT Error: project_id is required' 
+            sys.exit(1)
+	if (self.location_id is None):
+            print 'GoogleIOT Error: location_id is required' 
+            sys.exit(1)
+	if (self.registry_id is None):
+            print 'GoogleIOT Error: registry_id is required' 
+            sys.exit(1)
+	if (self.device_id is None):
+            print 'GoogleIOT Error: device_id is required' 
+            sys.exit(1)
+
+	self.client_id = 'projects/{}/locations/{}/registries/{}/devices/{}'.format(
+                               self.project_id,
+                               self.location_id,
+                               self.registry_id,
+                               self.device_id)
+        dbgmsg('GoogleIOT: client_id=%s' % (self.client_id))
+
+	self.base_topic= '/devices/{}/events'.format(self.device_id)
+        dbgmsg('GoogleIOT: base_topic=%s' % (self.base_topic))
+
+	with open(self.jwt_private_key, 'r') as myfile:
+	    self.pk_string=myfile.read()
+            #dbgmsg('GoogleIOT: pk_string=%s' % (self.pk_string))
+
+        try:
+            self.tls = json.loads(self.tls) if self.tls else None
+        except Exception:
+            print 'GoogleIOT Error: google-iot-tls parameter must be valid JSON'
+            sys.exit(1)
+
+    def _get_jwt(self):
+	current_time = int(time.time())
+	claim = {'iat': current_time, 'exp': current_time+3600, 'aud': self.project_id}
+        dbgmsg('GoogleIOT: claim=%s' % (json.dumps(claim)))
+
+ 	jwt_token = jwt.encode(claim, self.pk_string, algorithm=self.jwt_signing_method)
+
+	return jwt_token
+
+    def _add_msg(self, packet, channel, payload):
+       if payload is None:
+           return
+       key = mklabel(packet['serial'], channel)
+       #if key in self.map:
+       #   key = self.map[key]
+       self._msgs.append({'topic': '%s/%s' % (self.base_topic, key),
+                    'payload': round(payload, 3),
+                    'qos': self.qos,
+                    'retain': self.retain})
+
+    def process_calculated(self, packets):
+        self._msgs = []
+        for p in packets:
+            self._add_msg(p, 'volts', p['volts'])
+#            for f in [FILTER_POWER, FILTER_CURRENT, FILTER_ENERGY, FILTER_PULSE, FILTER_SENSOR]:
+            for f in [FILTER_POWER, FILTER_ENERGY]:
+                for c in PACKET_FORMAT.channels(f):
+                    self._add_msg(p, c, p[c])
+            # Delta Wh
+            for c in PACKET_FORMAT.channels(FILTER_PE_LABELS):
+                self._add_msg(p, c+'_dwh', p[c+'_dwh'])
+
+        if len(self._msgs):
+            dbgmsg('GoogleIOT: len=%d, msgs=%s' % (len(self._msgs), json.dumps(self._msgs)))
+            auth={"username":"unknown", "password":self._get_jwt()}
+            publish.multiple(self._msgs, hostname=self.host, port=self.port,
+                             client_id=self.client_id, auth=auth,
+                             will=None, tls=self.tls)
+            self.msgs = None
+        else:
+           dbgmsg('GoogleIOT: Nothing to send')
 
 
 if __name__ == '__main__':
@@ -4375,6 +4509,22 @@ if __name__ == '__main__':
     group.add_option('--mqtt-tls', help='tls credentials', metavar='{"ca_certs":"<ca_certs>", "certfile":"<certfile>", "keyfile":"<keyfile>", "tls_version":"<tls_version>", "ciphers":"<ciphers>"}')
     group.add_option('--mqtt-map', help='channel-to-topic mapping', metavar='<channel-1>,<topic-1>,...<channel-n>,<topic-n>')
     group.add_option('--mqtt-upload-period', type='int', help='upload period in seconds', metavar='PERIOD')
+    parser.add_option_group(group)
+
+    group = optparse.OptionGroup(parser, 'GoogleIOT options')
+    group.add_option('--google-iot', action='store_true', dest='google_iot_out', default=False, help='upload data using Google IOT MQTT')
+    group.add_option('--google-iot-project-id', help='project_id', metavar='PROJECTID')
+    group.add_option('--google-iot-location-id', help='us-central1, etc', metavar='LOCATIONID')
+    group.add_option('--google-iot-registry-id', help='registry_id', metavar='REGISTRYID')
+    group.add_option('--google-iot-device-id', help='device_id', metavar='DEVICEID')
+    group.add_option('--google-iot-tls', help='tls credentials', metavar='{"ca_certs":"<ca_certs>", "certfile":"<certfile>", "keyfile":"<keyfile>", "tls_version":"<tls_version>", "ciphers":"<ciphers>"}')
+    group.add_option('--google-iot-host', help='google iot host', metavar='HOSTNAME')
+    group.add_option('--google-iot-port', type='int', help='google iot port', metavar='PORT')
+    group.add_option('--google-iot-period', type='int', help='upload period in seconds', metavar='PERIOD')
+    group.add_option('--google-iot-jwt-private-key', help='private key', metavar='PRIVATEKEY')
+    group.add_option('--google-iot-jwt-signing-method', help='signing method', metavar='SIGNINGMETHOD')
+    group.add_option('--google-iot-qos', type='int', help='quality of service', metavar='QOS')
+    group.add_option('--google-iot-retain', action='store_true', help='retain msg as last good value', metavar='RETAIN')
     parser.add_option_group(group)
 
     (options, args) = parser.parse_args()
@@ -4719,6 +4869,20 @@ if __name__ == '__main__':
                       options.mqtt_tls,
                       options.mqtt_map or MQTT_MAP,
                       options.mqtt_upload_period or MQTT_UPLOAD_PERIOD))
+    if options.google_iot_out:
+        procs.append(GoogleIOTProcessor
+                     (options.google_iot_project_id,
+                      options.google_iot_location_id or GOOGLE_IOT_LOCATION_ID,
+                      options.google_iot_registry_id,
+                      options.google_iot_device_id,
+                      options.google_iot_tls or GOOGLE_IOT_TLS,
+                      options.google_iot_host or GOOGLE_IOT_HOST,
+                      options.google_iot_port or GOOGLE_IOT_PORT,
+                      options.google_iot_period or GOOGLE_IOT_PERIOD,
+                      options.google_iot_jwt_private_key,
+                      options.google_iot_jwt_signing_method or GOOGLE_IOT_JWT_SIGNING_METHOD,
+                      options.google_iot_qos or GOOGLE_IOT_QOS,
+                      options.google_iot_retain or GOOGLE_IOT_RETAIN))
 
     mon = Monitor(col, procs)
     mon.run()
